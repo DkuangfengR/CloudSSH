@@ -87,3 +87,20 @@ export interface AIConfig {
   model: string;
   api_key: string;
 }
+
+import type {
+  KnowledgeCategory,
+  ServerKnowledgeItem,
+  ServerWorkLog,
+  UnifiedServerMemory,
+} from '../../server-memory-schema';
+
+export type { ServerWorkLog, ServerKnowledgeItem, UnifiedServerMemory, KnowledgeCategory };
+
+export interface AgentMemoryProvider {
+  fetchUnifiedMemory(): Promise<UnifiedServerMemory>;
+  saveBatchMemory(batch: {
+    workLog?: { title: string; summary: string };
+    knowledge?: Array<{ category: KnowledgeCategory; key: string; value: string }>;
+  }): Promise<void>;
+}

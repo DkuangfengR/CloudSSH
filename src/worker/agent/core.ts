@@ -1,11 +1,23 @@
 // Agent Core — control loop that runs inside Durable Object
 
-import { type AgentLocale, getResponseLanguageInstruction, getSystemPrompt } from './prompt';
+import {
+  normalizeKnowledgeInput,
+  normalizeWorkLogInput,
+  type UnifiedServerMemory,
+} from '../../server-memory-schema';
+import {
+  type AgentLocale,
+  formatServerMemoryForPrompt,
+  getResponseLanguageInstruction,
+  getSystemPrompt,
+  MEMORY_DISTILLATION_PROMPT,
+} from './prompt';
 import type { TerminalContext } from './terminal-context';
 import { ToolExecutor } from './tool-executor';
 import { AGENT_TOOLS } from './tools';
 import type {
   AgentConfig,
+  AgentMemoryProvider,
   AgentState,
   AIConfig,
   ChatCompletionResponse,
@@ -51,6 +63,9 @@ export class AgentCore {
   private environmentContext: string = '';
   private terminalContextSnapshot: string = '';
   private preferredLocale: AgentLocale = 'zh-CN';
+  private userTimezone: string = 'UTC';
+  private unifiedMemory: UnifiedServerMemory = { workLogs: [], knowledge: [] };
+  private distillationInProgress: boolean = false;
 
   constructor(
     private terminalContext: TerminalContext,
@@ -66,7 +81,8 @@ export class AgentCore {
       exitCode: number;
     }>,
     private askConfirmation: (command: string, reason: string) => Promise<boolean>,
-    config?: Partial<AgentConfig>
+    config?: Partial<AgentConfig>,
+    private memoryProvider?: AgentMemoryProvider
   ) {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.toolExecutor = new ToolExecutor(
@@ -150,9 +166,13 @@ export class AgentCore {
   async handleAgentStart(
     userId: string,
     userMessage: string,
-    locale: AgentLocale = 'zh-CN'
+    locale: AgentLocale = 'zh-CN',
+    timezone?: string
   ): Promise<void> {
     this.preferredLocale = locale;
+    if (timezone && typeof timezone === 'string' && timezone.length <= 64) {
+      this.userTimezone = timezone;
+    }
     // Cancel stale timeout from previous loop so it can't abort the new controller
     if (this.loopTimeout) {
       clearTimeout(this.loopTimeout);
@@ -183,6 +203,12 @@ export class AgentCore {
     }
 
     if (isNewSession) {
+      if (this.memoryProvider) {
+        this.unifiedMemory = await this.memoryProvider.fetchUnifiedMemory().catch(() => ({
+          workLogs: [],
+          knowledge: [],
+        }));
+      }
       // 2. 首次启动：采集环境 + 终端上下文（注入 system prompt），用户消息保持干净
       this.terminalContextSnapshot = this.terminalContext.snapshot(200);
       const envSnapshot = await this.toolExecutor
@@ -205,7 +231,16 @@ export class AgentCore {
         { role: 'user', content: userMessage },
       ];
     } else {
-      // 3. 后续请求：追加新用户消息到已有对话历史
+      // 3. 后续请求：追加新用户消息到已有对话历史，并刷新 system prompt 以同步最新时间与记忆
+      if (this.memoryProvider) {
+        this.unifiedMemory = await this.memoryProvider
+          .fetchUnifiedMemory()
+          .catch(() => this.unifiedMemory);
+      }
+      this.state.messages[0] = {
+        role: 'system',
+        content: this.buildSystemPromptWithSummary(),
+      };
       this.state.messages.push({
         role: 'user',
         content: userMessage,
@@ -402,6 +437,8 @@ export class AgentCore {
           content: choice.message.content || (this.preferredLocale === 'en-US' ? 'Task completed.' : '任务已执行完成。'),
         });
         this.state.status = 'idle';
+        const snapshotMsgs = this.state.messages.slice(-10);
+        void this.triggerMemoryDistillationIfEligible(snapshotMsgs);
         return;
       }
 
@@ -795,6 +832,17 @@ export class AgentCore {
     if (this.state.summary) {
       parts.push(`## 之前的对话摘要\n${this.state.summary}`);
     }
+    if (this.unifiedMemory.workLogs.length > 0 || this.unifiedMemory.knowledge.length > 0) {
+      const memoryText = formatServerMemoryForPrompt(
+        this.unifiedMemory,
+        this.preferredLocale,
+        Date.now(),
+        this.userTimezone
+      );
+      if (memoryText) {
+        parts.push(memoryText);
+      }
+    }
 
     return parts.join('\n\n');
   }
@@ -890,5 +938,138 @@ ${conversationText}${previousSection}`;
     }
 
     return null;
+  }
+
+  private async triggerMemoryDistillationIfEligible(snapshotMsgs: ChatMessage[]): Promise<void> {
+    if (!this.memoryProvider || this.distillationInProgress || snapshotMsgs.length < 2) {
+      return;
+    }
+    this.distillationInProgress = true;
+    try {
+      await this.distillMemoryWithLLM(snapshotMsgs);
+    } catch {
+      // 提炼失败不得影响正常交互
+    } finally {
+      this.distillationInProgress = false;
+    }
+  }
+
+  private async distillMemoryWithLLM(snapshotMsgs: ChatMessage[]): Promise<void> {
+    const config = this.agentConfig;
+    if (!config || !this.memoryProvider) return;
+
+    // 选取刚才同步快照的消息用于分析
+    const recentMsgs = snapshotMsgs
+      .map((m) => {
+        if (m.role === 'user') return `用户: ${m.content}`;
+        if (m.role === 'assistant') {
+          if (m.tool_calls) {
+            const cmds = m.tool_calls.map((tc) => tc.function.arguments).join(', ');
+            return `AI执行命令: ${cmds}`;
+          }
+          return `AI回复: ${m.content}`;
+        }
+        if (m.role === 'tool') {
+          return `命令输出: ${m.content?.slice(0, 300)}`;
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+
+    if (!recentMsgs || recentMsgs.length < 20) return;
+
+    try {
+      let cleanBaseUrl = config.base_url.replace(/\/$/, '');
+      if (cleanBaseUrl.endsWith('/chat/completions')) {
+        cleanBaseUrl = cleanBaseUrl.slice(0, -'/chat/completions'.length);
+      }
+
+      const res = await fetch(`${cleanBaseUrl}/chat/completions`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.api_key}`,
+        },
+        body: JSON.stringify({
+          model: config.model,
+          messages: [
+            { role: 'system', content: MEMORY_DISTILLATION_PROMPT },
+            { role: 'user', content: `会话记录如下：\n${recentMsgs}` },
+          ],
+          max_tokens: 500,
+          temperature: 0.1,
+        }),
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (res.status >= 300 && res.status < 400) {
+        console.error('SSRF Distillation Fetch Redirect blocked:', res.status);
+        return;
+      }
+
+      if (!res.ok) return;
+
+      const data = await res.json<{ choices: Array<{ message: { content: string } }> }>();
+      const rawContent = data.choices?.[0]?.message?.content?.trim();
+      if (!rawContent) return;
+
+      let jsonStr = rawContent;
+      const jsonMatch = rawContent.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[1].trim();
+      }
+
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(jsonStr);
+      } catch {
+        return;
+      }
+
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return;
+      }
+
+      let workLogToSave: { title: string; summary: string } | undefined;
+      if (parsed.workLog && typeof parsed.workLog === 'object') {
+        const normLog = normalizeWorkLogInput({
+          title: parsed.workLog.title,
+          summary: parsed.workLog.summary,
+        });
+        if (normLog.ok) {
+          workLogToSave = normLog.value;
+        }
+      }
+
+      const knowledgeToSave: Array<{ category: any; key: string; value: string }> = [];
+      if (Array.isArray(parsed.knowledge)) {
+        for (const k of parsed.knowledge) {
+          const normK = normalizeKnowledgeInput({
+            category: k.category,
+            key: k.key,
+            value: k.value,
+          });
+          if (normK.ok) {
+            knowledgeToSave.push(normK.value);
+          }
+        }
+      }
+
+      if (workLogToSave || knowledgeToSave.length > 0) {
+        await this.memoryProvider.saveBatchMemory({
+          workLog: workLogToSave,
+          knowledge: knowledgeToSave.length > 0 ? knowledgeToSave : undefined,
+        });
+        this.unifiedMemory = await this.memoryProvider.fetchUnifiedMemory().catch(() => this.unifiedMemory);
+        this.sendToFrontend({
+          type: 'agent_frame',
+          subType: 'memory_updated',
+        });
+      }
+    } catch {
+      // 提炼失败静默忽略
+    }
   }
 }
